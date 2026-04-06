@@ -44,10 +44,16 @@ router.get("/conversations", verifyAuth, async (req, res) => {
       .populate("appointmentId", "date time")
       .sort({ lastMessageAt: -1 });
     
-    const formatted = conversations.map(conv => {
+    const formatted = await Promise.all(conversations.map(async (conv) => {
       const other = conv.participants.find(
         p => p.userId._id.toString() !== req.user._id.toString()
       );
+      
+      // Get last message with status
+      const lastMessageObj = await Message.findOne({ conversationId: conv._id })
+        .sort({ createdAt: -1 })
+        .populate("senderId", "name");
+      
       return {
         _id: conv._id,
         otherUser: {
@@ -56,12 +62,22 @@ router.get("/conversations", verifyAuth, async (req, res) => {
           email: other?.userId.email || "",
           role: other?.role || ""
         },
-        lastMessage: conv.lastMessage || "",
-        lastMessageAt: conv.lastMessageAt,
-        unreadCount: 0,
+        lastMessage: lastMessageObj?.content || conv.lastMessage || "",
+        lastMessageAt: lastMessageObj?.createdAt || conv.lastMessageAt,
+        lastMessageId: lastMessageObj?._id,
+        lastMessageStatus: lastMessageObj ? {
+          isRead: lastMessageObj.isRead || false,
+          deliveredAt: lastMessageObj.deliveredAt || null,
+          isSentByMe: lastMessageObj.senderId?._id.toString() === req.user._id.toString()
+        } : null,
+        unreadCount: await Message.countDocuments({
+          conversationId: conv._id,
+          receiverId: req.user._id,
+          isRead: false
+        }),
         appointment: conv.appointmentId
       };
-    });
+    }));
     
     res.json(formatted);
   } catch (error) {
@@ -70,7 +86,7 @@ router.get("/conversations", verifyAuth, async (req, res) => {
   }
 });
 
-// Get messages for a conversation
+// Get messages for a conversation (with auto-delivery tracking)
 router.get("/conversations/:conversationId/messages", verifyAuth, async (req, res) => {
   try {
     const { conversationId } = req.params;
@@ -88,6 +104,16 @@ router.get("/conversations/:conversationId/messages", verifyAuth, async (req, re
     if (!isParticipant) {
       return res.status(403).json({ error: "Not authorized" });
     }
+    
+    // Auto-mark messages as delivered when fetched by receiver
+    await Message.updateMany(
+      {
+        conversationId,
+        receiverId: req.user._id,
+        deliveredAt: null
+      },
+      { deliveredAt: new Date() }
+    );
     
     const messages = await Message.find({ conversationId })
       .sort({ createdAt: 1 })
@@ -135,7 +161,8 @@ router.post("/conversations/:conversationId/messages", verifyAuth, async (req, r
       content: content.trim(),
       messageType: messageType || "text",
       prescriptionData,
-      isRead: false
+      isRead: false,
+      deliveredAt: null
     });
     
     await message.save();
@@ -155,7 +182,97 @@ router.post("/conversations/:conversationId/messages", verifyAuth, async (req, r
   }
 });
 
-// Create a new conversation (if needed)
+// Mark message as delivered
+router.put("/:messageId/delivered", verifyAuth, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    
+    // Only the receiver can mark as delivered
+    if (message.receiverId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Unauthorized - Only receiver can mark as delivered" });
+    }
+    
+    // Only update if not already delivered
+    if (!message.deliveredAt) {
+      message.deliveredAt = new Date();
+      await message.save();
+    }
+    
+    res.json({ 
+      success: true, 
+      messageId: message._id,
+      deliveredAt: message.deliveredAt 
+    });
+  } catch (error) {
+    console.error("Error marking message as delivered:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Mark message as read
+router.put("/:messageId/read", verifyAuth, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+    
+    // Only the receiver can mark as read
+    if (message.receiverId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Unauthorized - Only receiver can mark as read" });
+    }
+    
+    // Only update if not already read
+    if (!message.isRead) {
+      message.isRead = true;
+      message.readAt = new Date();
+      await message.save();
+    }
+    
+    res.json({ 
+      success: true, 
+      messageId: message._id,
+      isRead: message.isRead,
+      readAt: message.readAt
+    });
+  } catch (error) {
+    console.error("Error marking message as read:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get unread messages count (with auto-delivery tracking)
+router.get("/unread/count", verifyAuth, async (req, res) => {
+  try {
+    // Mark messages as delivered when checking unread count
+    await Message.updateMany(
+      {
+        receiverId: req.user._id,
+        deliveredAt: null
+      },
+      { deliveredAt: new Date() }
+    );
+    
+    const unreadCount = await Message.countDocuments({
+      receiverId: req.user._id,
+      isRead: false
+    });
+    
+    res.json({ unreadCount });
+  } catch (error) {
+    console.error("Error fetching unread count:", error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Create a new conversation
 router.post("/conversations", verifyAuth, async (req, res) => {
   try {
     const { otherUserId, appointmentId } = req.body;

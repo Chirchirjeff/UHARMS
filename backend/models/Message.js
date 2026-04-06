@@ -50,6 +50,11 @@ const messageSchema = new mongoose.Schema({
   },
   readAt: {
     type: Date
+  },
+  // NEW: Track when message was delivered to receiver
+  deliveredAt: {
+    type: Date,
+    default: null
   }
 }, {
   timestamps: true
@@ -57,6 +62,8 @@ const messageSchema = new mongoose.Schema({
 
 // ✅ Important for fast message loading
 messageSchema.index({ conversationId: 1, createdAt: -1 });
+// NEW: Index for tracking unread/delivered messages
+messageSchema.index({ receiverId: 1, isRead: 1, deliveredAt: 1 });
 
 const Message = mongoose.model("Message", messageSchema);
 export default Message;

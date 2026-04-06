@@ -39,6 +39,8 @@ interface Message {
   };
   createdAt: string;
   isRead: boolean;
+  // Add delivery status field (for sent vs delivered)
+  deliveredAt?: string | null;
 }
 
 const ChatScreen: React.FC<ChatScreenProps> = ({ route, navigation }) => {
@@ -58,15 +60,61 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ route, navigation }) => {
 
   const flatListRef = useRef<FlatList>(null);
   const isDoctor = user?.role === 'doctor';
+  const pollingInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     fetchMessages();
+    
+    // Start polling for message status updates every 5 seconds
+    startPolling();
 
     navigation.setOptions({
       title: otherUser?.name || 'Chat',
       headerTitleAlign: 'center',
     });
+
+    // Cleanup polling on unmount
+    return () => {
+      if (pollingInterval.current) {
+        clearInterval(pollingInterval.current);
+      }
+    };
   }, []);
+
+  const startPolling = () => {
+    if (pollingInterval.current) {
+      clearInterval(pollingInterval.current);
+    }
+    
+    pollingInterval.current = setInterval(async () => {
+      await updateMessageStatuses();
+    }, 5000); // Poll every 5 seconds
+  };
+
+  const updateMessageStatuses = async () => {
+    try {
+      const response = await fetch(`${BASE_URL}/messages/conversations/${conversationId}/messages`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (response.ok) {
+        const updatedMessages = await response.json();
+        setMessages((prevMessages) => {
+          // Only update status fields, preserve message content
+          const updated = prevMessages.map((msg) => {
+            const found = updatedMessages.find((um: any) => um._id === msg._id);
+            if (found && (msg.isRead !== found.isRead || msg.deliveredAt !== found.deliveredAt)) {
+              return { ...msg, isRead: found.isRead, deliveredAt: found.deliveredAt };
+            }
+            return msg;
+          });
+          return updated;
+        });
+      }
+    } catch (error) {
+      console.error('Error updating message statuses:', error);
+    }
+  };
 
   const fetchMessages = async () => {
     try {
@@ -96,6 +144,29 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ route, navigation }) => {
     }
   };
 
+  // Mark message as read when viewed
+  const markMessageAsRead = async (messageId: string) => {
+    try {
+      await fetch(`${BASE_URL}/messages/${messageId}/read`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch (error) {
+      console.error('Error marking message as read:', error);
+    }
+  };
+
+  // When user opens chat, mark unread messages as read
+  useEffect(() => {
+    const unreadMessages = messages.filter(
+      (msg) => !msg.isRead && msg.senderId?._id !== user?.id
+    );
+    
+    if (unreadMessages.length > 0) {
+      unreadMessages.forEach((msg) => markMessageAsRead(msg._id));
+    }
+  }, [messages]);
+
   const sendMessage = async (content: string, type: string = 'text', prescriptionData?: any) => {
     if (!content.trim() && type === 'text') return;
 
@@ -112,6 +183,7 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ route, navigation }) => {
       prescriptionData,
       createdAt: new Date().toISOString(),
       isRead: false,
+      deliveredAt: null, // Not delivered yet
     };
 
     setMessages((prev) => [...prev, tempMessage]);
@@ -136,7 +208,7 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ route, navigation }) => {
 
       if (response.ok) {
         setMessages((prev) =>
-          prev.map((msg) => (msg._id === tempMessage._id ? data : msg))
+          prev.map((msg) => (msg._id === tempMessage._id ? { ...data, deliveredAt: data.deliveredAt || null } : msg))
         );
       } else {
         setMessages((prev) => prev.filter((msg) => msg._id !== tempMessage._id));
@@ -149,6 +221,39 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ route, navigation }) => {
     } finally {
       setSending(false);
     }
+  };
+
+  // Render message status icons
+  const renderMessageStatus = (message: Message) => {
+    if (message.senderId?._id !== user?.id) return null;
+    
+    // Check if message is read
+    if (message.isRead) {
+      return (
+        <View style={styles.statusContainer}>
+          <Icon name="check-all" size={14} color="#16a34a" />
+          <Text style={[styles.statusText, { color: '#16a34a' }]}>Read</Text>
+        </View>
+      );
+    }
+    
+    // Check if message is delivered (has deliveredAt timestamp)
+    if (message.deliveredAt) {
+      return (
+        <View style={styles.statusContainer}>
+          <Icon name="check-all" size={14} color="#94a3b8" />
+          <Text style={[styles.statusText, { color: '#94a3b8' }]}>Delivered</Text>
+        </View>
+      );
+    }
+    
+    // Message sent but not delivered
+    return (
+      <View style={styles.statusContainer}>
+        <Icon name="check" size={14} color="#94a3b8" />
+        <Text style={[styles.statusText, { color: '#94a3b8' }]}>Sent</Text>
+      </View>
+    );
   };
 
   const addMedicine = () => {
@@ -224,12 +329,15 @@ const ChatScreen: React.FC<ChatScreenProps> = ({ route, navigation }) => {
             {item.content}
           </Text>
 
-          <Text style={styles.messageTime}>
-            {new Date(item.createdAt).toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit',
-            })}
-          </Text>
+          <View style={styles.messageFooter}>
+            <Text style={styles.messageTime}>
+              {new Date(item.createdAt).toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+              })}
+            </Text>
+            {isMyMessage && renderMessageStatus(item)}
+          </View>
         </View>
       </View>
     );
@@ -401,7 +509,10 @@ const styles = StyleSheet.create({
   otherBubble: { backgroundColor: '#fff', borderTopLeftRadius: 4, elevation: 1 },
   messageText: { fontSize: 14, color: '#fff' },
   otherMessageText: { color: '#1e293b' },
-  messageTime: { fontSize: 10, color: '#94a3b8', marginTop: 4, alignSelf: 'flex-end' },
+  messageFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', marginTop: 4, gap: 8 },
+  messageTime: { fontSize: 10, color: '#94a3b8' },
+  statusContainer: { flexDirection: 'row', alignItems: 'center', gap: 2 },
+  statusText: { fontSize: 9, marginLeft: 2 },
   prescriptionBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, marginBottom: 4 },
   prescriptionBadgeText: { fontSize: 10, color: '#16a34a', fontWeight: '500' },
   inputContainer: { flexDirection: 'row', padding: 12, backgroundColor: '#fff', borderTopWidth: 1, borderTopColor: '#e2e8f0', alignItems: 'flex-end' },

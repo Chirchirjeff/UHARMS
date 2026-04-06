@@ -1,5 +1,5 @@
 // src/screens/shared/MessageListScreen.tsx
-import React, { useState, useContext, useCallback } from 'react';
+import React, { useState, useContext, useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -38,7 +38,43 @@ interface Conversation {
     date: string;
     time: string;
   };
+  // New fields for message status
+  lastMessageId?: string;
+  lastMessageStatus?: {
+    isRead: boolean;
+    deliveredAt: string | null;
+    isSentByMe: boolean;
+  };
 }
+
+// Helper function to get message status icon and text
+const getMessageStatusIndicator = (status: Conversation['lastMessageStatus']) => {
+  if (!status) return null;
+  
+  if (!status.isSentByMe) return null; // Only show status for messages sent by current user
+  
+  if (status.isRead) {
+    return {
+      icon: "check-all",
+      color: "#16a34a",
+      text: "Read"
+    };
+  }
+  
+  if (status.deliveredAt) {
+    return {
+      icon: "check-all",
+      color: "#94a3b8",
+      text: "Delivered"
+    };
+  }
+  
+  return {
+    icon: "check",
+    color: "#94a3b8",
+    text: "Sent"
+  };
+};
 
 const MessageListScreen: React.FC = () => {
   const { user, token } = useContext(AuthContext);
@@ -47,6 +83,7 @@ const MessageListScreen: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusPollingInterval, setStatusPollingInterval] = useState<ReturnType<typeof setInterval> | null>(null);
 
   const fetchConversations = async () => {
     if (!token) {
@@ -75,7 +112,39 @@ const MessageListScreen: React.FC = () => {
 
       const data = await response.json();
       console.log('Conversations received:', data.length);
-      setConversations(data);
+      
+      // Fetch latest message status for each conversation
+      const conversationsWithStatus = await Promise.all(
+        data.map(async (conv: Conversation) => {
+          try {
+            const messagesResponse = await fetch(`${BASE_URL}/messages/conversations/${conv._id}/messages`, {
+              headers: { 'Authorization': `Bearer ${token}` },
+            });
+            
+            if (messagesResponse.ok) {
+              const messages = await messagesResponse.json();
+              const lastMessage = messages[messages.length - 1];
+              
+              if (lastMessage) {
+                return {
+                  ...conv,
+                  lastMessageId: lastMessage._id,
+                  lastMessageStatus: {
+                    isRead: lastMessage.isRead || false,
+                    deliveredAt: lastMessage.deliveredAt || null,
+                    isSentByMe: lastMessage.senderId?._id === user?.id
+                  }
+                };
+              }
+            }
+          } catch (error) {
+            console.error('Error fetching message status:', error);
+          }
+          return conv;
+        })
+      );
+      
+      setConversations(conversationsWithStatus);
       setError(null);
     } catch (error) {
       console.error('Error fetching conversations:', error);
@@ -86,9 +155,85 @@ const MessageListScreen: React.FC = () => {
     }
   };
 
+  // Poll for message status updates
+  const startStatusPolling = useCallback(() => {
+    if (statusPollingInterval) {
+      clearInterval(statusPollingInterval);
+    }
+    
+    const interval = setInterval(async () => {
+      if (token && conversations.length > 0) {
+        // Update status for conversations that have unread or undelivered messages
+        const updatedConversations = await Promise.all(
+          conversations.map(async (conv) => {
+            if (conv.lastMessageId && conv.lastMessageStatus?.isSentByMe && !conv.lastMessageStatus.isRead) {
+              try {
+                const messagesResponse = await fetch(`${BASE_URL}/messages/conversations/${conv._id}/messages`, {
+                  headers: { 'Authorization': `Bearer ${token}` },
+                });
+                
+                if (messagesResponse.ok) {
+                  const messages = await messagesResponse.json();
+                  const lastMessage = messages[messages.length - 1];
+                  
+                  if (lastMessage && lastMessage._id === conv.lastMessageId) {
+                    const newStatus = {
+                      isRead: lastMessage.isRead || false,
+                      deliveredAt: lastMessage.deliveredAt || null,
+                      isSentByMe: true
+                    };
+                    
+                    // Only update if status changed
+                    if (newStatus.isRead !== conv.lastMessageStatus?.isRead ||
+                        newStatus.deliveredAt !== conv.lastMessageStatus?.deliveredAt) {
+                      return { ...conv, lastMessageStatus: newStatus };
+                    }
+                  }
+                }
+              } catch (error) {
+                console.error('Error polling message status:', error);
+              }
+            }
+            return conv;
+          })
+        );
+        
+        // Only update state if something changed
+        const hasChanges = updatedConversations.some((conv, index) => 
+          JSON.stringify(conv.lastMessageStatus) !== JSON.stringify(conversations[index].lastMessageStatus)
+        );
+        
+        if (hasChanges) {
+          setConversations(updatedConversations);
+        }
+      }
+    }, 5000); // Poll every 5 seconds
+    
+    setStatusPollingInterval(interval);
+  }, [token, conversations]);
+
+  // Stop polling on unmount
+  useEffect(() => {
+    return () => {
+      if (statusPollingInterval) {
+        clearInterval(statusPollingInterval);
+      }
+    };
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       fetchConversations();
+      
+      // Start polling when screen is focused
+      const interval = setTimeout(() => {
+        startStatusPolling();
+      }, 1000);
+      
+      return () => {
+        if (interval) clearTimeout(interval);
+        if (statusPollingInterval) clearInterval(statusPollingInterval);
+      };
     }, [token])
   );
 
@@ -124,57 +269,71 @@ const MessageListScreen: React.FC = () => {
     fetchConversations();
   };
 
-  const renderConversation = ({ item }: { item: Conversation }) => (
-    <TouchableOpacity
-      style={styles.conversationCard}
-      onPress={() =>
-        navigation.navigate('ChatScreen', {
-          conversationId: item._id,
-          otherUser: item.otherUser,
-          appointment: item.appointment
-        })
-      }
-      activeOpacity={0.7}
-    >
-      <View style={styles.avatar}>
-        <Text style={styles.avatarText}>
-          {getInitials(item.otherUser?.name)}
-        </Text>
-      </View>
-
-      <View style={styles.conversationInfo}>
-        <View style={styles.conversationHeader}>
-          <Text style={styles.userName}>
-            {item.otherUser?.name || 'Unknown'}
-          </Text>
-          <Text style={styles.timeText}>
-            {formatTime(item.lastMessageAt)}
+  const renderConversation = ({ item }: { item: Conversation }) => {
+    const statusIndicator = getMessageStatusIndicator(item.lastMessageStatus);
+    
+    return (
+      <TouchableOpacity
+        style={styles.conversationCard}
+        onPress={() =>
+          navigation.navigate('ChatScreen', {
+            conversationId: item._id,
+            otherUser: item.otherUser,
+            appointment: item.appointment
+          })
+        }
+        activeOpacity={0.7}
+      >
+        <View style={styles.avatar}>
+          <Text style={styles.avatarText}>
+            {getInitials(item.otherUser?.name)}
           </Text>
         </View>
 
-        <Text style={styles.lastMessage} numberOfLines={1}>
-          {item.lastMessage?.trim() || 'Tap to start messaging'}
-        </Text>
+        <View style={styles.conversationInfo}>
+          <View style={styles.conversationHeader}>
+            <Text style={styles.userName}>
+              {item.otherUser?.name || 'Unknown'}
+            </Text>
+            <Text style={styles.timeText}>
+              {formatTime(item.lastMessageAt)}
+            </Text>
+          </View>
 
-        {item.appointment && (
-          <View style={styles.appointmentBadge}>
-            <Icon name="calendar" size={12} color="#16a34a" />
-            <Text style={styles.appointmentText}>
-              Appointment: {item.appointment.date}
+          <View style={styles.lastMessageContainer}>
+            {statusIndicator && (
+              <Icon 
+                name={statusIndicator.icon} 
+                size={14} 
+                color={statusIndicator.color}
+                style={styles.statusIcon}
+              />
+            )}
+            <Text style={styles.lastMessage} numberOfLines={1}>
+              {item.lastMessage?.trim() || 'Tap to start messaging'}
+            </Text>
+          </View>
+
+          {item.appointment && (
+            <View style={styles.appointmentBadge}>
+              <Icon name="calendar" size={12} color="#16a34a" />
+              <Text style={styles.appointmentText}>
+                Appointment: {item.appointment.date}
+              </Text>
+            </View>
+          )}
+        </View>
+
+        {item.unreadCount > 0 && (
+          <View style={styles.unreadBadge}>
+            <Text style={styles.unreadText}>
+              {item.unreadCount}
             </Text>
           </View>
         )}
-      </View>
-
-      {item.unreadCount > 0 && (
-        <View style={styles.unreadBadge}>
-          <Text style={styles.unreadText}>
-            {item.unreadCount}
-          </Text>
-        </View>
-      )}
-    </TouchableOpacity>
-  );
+      </TouchableOpacity>
+    );
+  };
 
   if (loading) {
     return (
@@ -326,7 +485,19 @@ const styles = StyleSheet.create({
   },
   userName: { fontSize: 16, fontWeight: '600', color: '#1e293b' },
   timeText: { fontSize: 11, color: '#94a3b8' },
-  lastMessage: { fontSize: 13, color: '#64748b' },
+  lastMessageContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 2,
+  },
+  statusIcon: {
+    marginRight: 4,
+  },
+  lastMessage: { 
+    fontSize: 13, 
+    color: '#64748b',
+    flex: 1,
+  },
   appointmentBadge: {
     flexDirection: 'row',
     alignItems: 'center',
